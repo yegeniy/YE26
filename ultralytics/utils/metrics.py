@@ -78,39 +78,41 @@ def box_iou(box1: torch.Tensor, box2: torch.Tensor, eps: float = 1e-7) -> torch.
     return inter / ((a2 - a1).prod(2) + (b2 - b1).prod(2) - inter + eps)
 
 
-class WIoU_Scale:
-    """Dynamic focusing mechanism for WIoU loss.
+class WIoULoss(torch.nn.Module):
+    """WIoU dynamic focusing mechanism, checkpoint-safe via register_buffer.
     
     Attributes:
         monotonous: None=v1 (origin), True=v2 (monotonic FM), False=v3 (non-monotonic FM)
-        momentum: Running mean momentum (half-life ~7000 steps)
+        iou_mean: Running mean of IoU, saved in checkpoints
     
     Reference: https://arxiv.org/abs/2301.10051
     """
-    iou_mean = 1.
-    monotonous = False
-    _momentum = 1 - 0.5 ** (1 / 7000)
-    _is_train = True
+    _momentum = 1 - 0.5 ** (1 / 7000)  # EDNet's momentum (~7000 step half-life)
 
-    def __init__(self, iou):
-        self.iou = iou
-        self._update(self)
+    def __init__(self, monotonous=False):
+        super().__init__()
+        self.monotonous = monotonous
+        self.register_buffer('iou_mean', torch.tensor(1.))
 
-    @classmethod
-    def _update(cls, self):
-        if cls._is_train:
-            cls.iou_mean = (1 - cls._momentum) * cls.iou_mean + cls._momentum * self.iou.detach().mean().item()
+    def forward(self, iou):
+        """Compute scale factor for WIoU loss.
 
-    @classmethod
-    def _scaled_loss(cls, self, gamma=1.9, delta=3):
-        if isinstance(self.monotonous, bool):
-            if self.monotonous:
-                return (self.iou.detach() / self.iou_mean).sqrt()
-            else:
-                beta = self.iou.detach() / self.iou_mean
-                alpha = delta * torch.pow(gamma, beta - delta)
-                return beta / alpha
-        return 1
+        Args:
+            iou: IoU tensor between pred and target boxes
+
+        Returns:
+            scale: Dynamic focusing weight (detached from graph)
+        """
+        if self.training:
+            self.iou_mean.lerp_(iou.detach().mean(), self._momentum)
+        # EDNet hyperparams: gamma=1.9, delta=3
+        if self.monotonous is None:
+            return torch.ones_like(iou)
+        beta = iou.detach() / self.iou_mean.clamp(min=1e-7)
+        if self.monotonous:
+            return beta.sqrt()
+        alpha = 3 * torch.pow(1.9, beta - 3)
+        return beta / alpha
 
 
 def bbox_iou(
@@ -121,7 +123,6 @@ def bbox_iou(
     DIoU: bool = False,
     CIoU: bool = False,
     WIoU: bool = False,
-    scale: bool = False,
     eps: float = 1e-7,
 ) -> torch.Tensor:
     """Calculate the Intersection over Union (IoU) between bounding boxes.
@@ -139,11 +140,10 @@ def bbox_iou(
         DIoU (bool, optional): If True, calculate Distance IoU.
         CIoU (bool, optional): If True, calculate Complete IoU.
         WIoU (bool, optional): If True, calculate Wise IoU with dynamic focusing.
-        scale (bool, optional): If True and WIoU=True, return scaled loss tuple.
         eps (float, optional): A small value to avoid division by zero.
 
     Returns:
-        (torch.Tensor | tuple): IoU values, or (scale, wiou_loss, iou) tuple if WIoU with scale.
+        (torch.Tensor | tuple): IoU values, or (wiou_loss, iou) tuple if WIoU.
     """
     # Get the coordinates of bounding boxes
     if xywh:  # transform from xywh to xyxy
@@ -165,9 +165,6 @@ def bbox_iou(
     # Union Area
     union = w1 * h1 + w2 * h2 - inter + eps
 
-    # WIoU scale factor (computed before iou for correct 1-iou input)
-    wiou_scale = WIoU_Scale(1 - inter / union) if scale else None
-
     # IoU
     iou = inter / union
     if CIoU or DIoU or GIoU or WIoU:
@@ -184,9 +181,8 @@ def bbox_iou(
                     alpha = v / (v - iou + (1 + eps))
                 return iou - (rho2 / c2 + v * alpha)  # CIoU
             if WIoU:  # https://arxiv.org/abs/2301.10051
-                if scale:
-                    return WIoU_Scale._scaled_loss(wiou_scale), (1 - iou) * torch.exp(rho2 / c2), iou
-                return iou, torch.exp(rho2 / c2)  # WIoU v1
+                wiou_loss = (1 - iou) * torch.exp(rho2 / c2)
+                return wiou_loss, iou  # loss term and raw iou (scale applied in BboxLoss)
             return iou - rho2 / c2  # DIoU
         c_area = cw * ch + eps  # convex area
         return iou - (c_area - union) / c_area  # GIoU https://arxiv.org/pdf/1902.09630.pdf

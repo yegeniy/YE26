@@ -114,6 +114,9 @@ class BboxLoss(nn.Module):
         super().__init__()
         self.dfl_loss = DFLoss(reg_max) if reg_max > 1 else None
         self.use_wiou = use_wiou
+        if use_wiou:
+            from ultralytics.utils.metrics import WIoULoss
+            self.wiou_scale = WIoULoss(monotonous=False)
 
     def forward(
         self,
@@ -130,10 +133,10 @@ class BboxLoss(nn.Module):
         """Compute IoU and DFL losses for bounding boxes."""
         weight = target_scores.sum(-1)[fg_mask].unsqueeze(-1)
         if self.use_wiou:
-            # WIoU with dynamic focusing (scale=True returns tuple: scale_factor, wiou_loss, iou)
-            iou_result = bbox_iou(pred_bboxes[fg_mask], target_bboxes[fg_mask], xywh=False, WIoU=True, scale=True)
-            scale_factor, wiou_loss, iou = iou_result
-            loss_iou = (wiou_loss * scale_factor.detach() * weight).sum() / target_scores_sum
+            # WIoU with dynamic focusing via WIoULoss module (checkpoint-safe)
+            wiou_loss, iou = bbox_iou(pred_bboxes[fg_mask], target_bboxes[fg_mask], xywh=False, WIoU=True)
+            scale = self.wiou_scale(iou)
+            loss_iou = (wiou_loss * scale * weight).sum() / target_scores_sum
         else:
             iou = bbox_iou(pred_bboxes[fg_mask], target_bboxes[fg_mask], xywh=False, CIoU=True)
             loss_iou = ((1.0 - iou) * weight).sum() / target_scores_sum
