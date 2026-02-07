@@ -28,6 +28,7 @@ verbose: True # (bool) print verbose logs during training/val
 seed: 0 # (int) random seed for reproducibility
 deterministic: True # (bool) enable deterministic ops; reproducible but may be slower
 single_cls: False # (bool) treat all classes as a single class
+wiou: False # (bool) use WIoU loss with dynamic focusing instead of CIoU
 rect: False # (bool) rectangular batches for train; rectangular batching for val when mode='val'
 cos_lr: False # (bool) cosine learning rate scheduler
 close_mosaic: 10 # (int) disable mosaic augmentation for final N epochs (0 to keep enabled)
